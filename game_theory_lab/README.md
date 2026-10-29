@@ -25,7 +25,11 @@ For internet-based play, deploy behind HTTPS using a Python-capable host and per
 
 ## Instructor workflow
 
-Create class -> students join -> choose game -> start round -> wait for responses -> advance / close round -> review outcomes -> launch next round -> export CSV.
+Create class -> students join -> choose game and time limit -> start round -> wait for responses -> advance / close round -> review and project the class summary -> launch next round -> export CSV.
+
+**Time limit.** Each round can have a time limit per stage (30 s to 3 min, default 90 s, or none). Students and the instructor see a countdown. When it reaches zero the stage closes by itself: Ultimatum moves to the responder stage with a fresh countdown, and other games show results. Students who haven't submitted get no payoff for that round. The instructor can still close a stage early.
+
+**Class summary.** When a round finishes, the instructor sees a summary with no names: headline numbers, a chart (guess or contribution distribution, offers accepted vs rejected, bids against valuations, supply and demand with trade prices, quantities against the Nash prediction), what theory predicts, and a round-by-round trend when the same game has been played more than once. **Project class results** opens it full screen for the classroom projector (Esc to close).
 
 The app keeps a record of decisions and computed payoffs across rounds. Participant nicknames are stored only in the participants table and are **not included in CSV exports**. CSV contains pseudonymous participant IDs, plus each player's role, pair or group number and private value, so matching can be reconstructed. Resting players appear with an empty decision. Student screens never reveal partner names or other students' decisions. Instructor sees the private roster (label and name) and outcome rows, and can remove students who have left so rounds no longer wait for them.
 
@@ -41,7 +45,7 @@ The app keeps a record of decisions and computed payoffs across rounds. Particip
 - Public Goods forms groups of about four (3–5 depending on class size; one group of up to 5 for classes under 6). The multiplier is not capped, so keep it between 1 and the group size for a social dilemma; group returns are shared equally including non-submitters, so close only after all participants have acted for clean outcomes.
 - Stored records are not automatically deleted. To reset data, stop server and remove `game_lab.db` (and any `-wal`/`-shm` files) or use a new `GTL_DB` file.
 - The instructor password is sent in a request header (never in URLs) and kept only in the open page. There is no rate limiting on password or PIN guesses; use HTTPS, or run only on a trusted classroom LAN.
-- No built-in timer, fixed-pair assignment, leaderboard, communication channel, or research-grade treatment randomization yet.
+- No fixed-pair assignment, leaderboard, communication channel, or research-grade treatment randomization yet.
 
 ## Files
 

@@ -195,3 +195,143 @@ def test_student_state_has_sizes_for_rules_text(client):
     join(client, pin)  # late joiner, not counted
     r = client.get(f'/api/state?pin={pin}&secret={people[0]["secret"]}').json()['round']
     assert r['players_in_round'] == 6 and r['group_size'] is None
+
+
+def set_deadline(pin, seconds_from_now):
+    import server
+    from datetime import datetime, timedelta, timezone
+    with server.db() as c:
+        s = server.session(c, pin)
+        r = server.current(c, s)
+        c.execute('UPDATE rounds SET deadline=? WHERE id=?', ((datetime.now(timezone.utc) + timedelta(seconds=seconds_from_now)).isoformat(), r['id']))
+
+
+def test_timer_counts_down_and_closes_round(client):
+    pin = new_session(client)
+    a, b = join(client, pin), join(client, pin)
+    client.post('/api/start', headers=H, json={'pin': pin, 'game': 'beauty', 'time_limit': 60})
+    r = admin_state(client, pin)['round']
+    assert r['time_limit'] == 60 and 55 < r['seconds_left'] <= 60
+    assert submit(client, pin, a, {'guess': 10}).status_code == 200
+    set_deadline(pin, -5)
+    assert submit(client, pin, b, {'guess': 20}).status_code == 409  # too late, and the round closes
+    r = admin_state(client, pin)['round']
+    assert r['phase'] == 'finished' and r['seconds_left'] is None
+    assert [x['points'] for x in r['results']] == [100]
+
+
+def test_timer_closes_round_on_poll_without_submissions(client):
+    pin = new_session(client)
+    a, b = join(client, pin), join(client, pin)
+    client.post('/api/start', headers=H, json={'pin': pin, 'game': 'prisoner', 'time_limit': 30})
+    set_deadline(pin, -5)
+    s = client.get(f'/api/state?pin={pin}&secret={a["secret"]}').json()
+    assert s['round']['phase'] == 'finished'
+
+
+def test_timer_moves_ultimatum_to_responders_with_fresh_clock(client):
+    pin = new_session(client)
+    join(client, pin); join(client, pin)
+    client.post('/api/start', headers=H, json={'pin': pin, 'game': 'ultimatum', 'time_limit': 45})
+    set_deadline(pin, -5)
+    r = admin_state(client, pin)['round']
+    assert r['phase'] == 'responder' and 40 < r['seconds_left'] <= 45
+
+
+def test_no_timer_by_default_and_limit_is_capped(client):
+    pin = new_session(client)
+    join(client, pin); join(client, pin)
+    start(client, pin, 'beauty')
+    r = admin_state(client, pin)['round']
+    assert r['time_limit'] == 0 and r['seconds_left'] is None
+    advance(client, pin)
+    client.post('/api/start', headers=H, json={'pin': pin, 'game': 'beauty', 'time_limit': 99999})
+    assert admin_state(client, pin)['round']['time_limit'] == 900
+
+
+def stats_of(summary):
+    return {x['label']: x['value'] for x in summary['stats']}
+
+
+def test_summary_prisoner_and_trend(client):
+    pin = new_session(client)
+    people = [join(client, pin) for _ in range(4)]
+    for choice in ('C', 'D'):
+        start(client, pin, 'prisoner')
+        for p in people:
+            submit(client, pin, p, {'choice': choice})
+        advance(client, pin)
+    sm = admin_state(client, pin)['round']['summary']
+    assert stats_of(sm)['Cooperated'] == 0 and stats_of(sm)['Both defected'] == 2
+    assert [b['value'] for b in sm['chart']['bars']] == [0, 0, 2]
+    assert [t['value'] for t in sm['trend']['points']] == [100, 0]
+    student = client.get(f'/api/state?pin={pin}&secret={people[0]["secret"]}').json()
+    assert 'summary' not in student['round']
+
+
+def test_summary_beauty_public_oligopoly(client):
+    pin = new_session(client)
+    people = [join(client, pin) for _ in range(4)]
+    start(client, pin, 'beauty')
+    for p, g in zip(people, (10, 20, 30, 40)):
+        submit(client, pin, p, {'guess': g})
+    advance(client, pin)
+    st = stats_of(admin_state(client, pin)['round']['summary'])
+    assert st['Average guess'] == 25 and st['Target'] == pytest.approx(16.67, abs=0.01) and st['Winning guess'] == '20'
+    start(client, pin, 'public')
+    for p, x in zip(people, (0, 50, 100, 100)):
+        submit(client, pin, p, {'contribution': x})
+    advance(client, pin)
+    sm = admin_state(client, pin)['round']['summary']
+    assert stats_of(sm)['Average contribution'] == 62.5 and stats_of(sm)['Gave nothing'] == 1
+    assert sum(b['value'] for b in sm['chart']['bars']) == 4
+    start(client, pin, 'oligopoly')
+    for p in people:
+        submit(client, pin, p, {'quantity': 18})
+    advance(client, pin)
+    st = stats_of(admin_state(client, pin)['round']['summary'])
+    assert st['Total quantity'] == 72 and st['Market price'] == 28 and st['Nash quantity per firm'] == 18
+
+
+def test_summary_trading_efficiency(client):
+    import server
+    pin = new_session(client)
+    people = [join(client, pin) for _ in range(4)]
+    start(client, pin, 'trading')
+    for p in people:
+        r = client.get(f'/api/state?pin={pin}&secret={p["secret"]}').json()['round']
+        submit(client, pin, p, {'price': r['private_value']})  # truthful limit prices
+    advance(client, pin)
+    sm = admin_state(client, pin)['round']['summary']
+    st = stats_of(sm)
+    assert st['Efficiency'] == 100 or st['Efficiency'] is None  # truthful bids realise every possible gain
+    assert sm['chart']['type'] == 'steps' and len(sm['chart']['demand']) == 2 and len(sm['chart']['supply']) == 2
+
+
+def test_summary_ultimatum_and_auction(client):
+    pin = new_session(client)
+    people = [join(client, pin) for _ in range(4)]
+    start(client, pin, 'ultimatum')
+    roles = {p['secret']: client.get(f'/api/state?pin={pin}&secret={p["secret"]}').json()['round']['role'] for p in people}
+    proposers = [p for p in people if roles[p['secret']] == 'proposer']
+    for p, offer in zip(proposers, (10, 50)):
+        submit(client, pin, p, {'offer': offer})
+    advance(client, pin)
+    # Each responder rejects 10 and accepts 50
+    for p in people:
+        r = client.get(f'/api/state?pin={pin}&secret={p["secret"]}').json()['round']
+        if r['role'] == 'responder':
+            submit(client, pin, p, {'accept': r['offer_received'] == 50})
+    advance(client, pin)
+    sm = admin_state(client, pin)['round']['summary']
+    st = stats_of(sm)
+    assert st['Average offer'] == 30 and st['Accepted'] == 50 and st['Highest rejected offer'] == 10
+    assert [b['values'] for b in sm['chart']['bars'] if sum(b['values'])] == [[0, 1], [1, 0]]
+    client.post('/api/start', headers=H, json={'pin': pin, 'game': 'auction', 'config': {'format': 'first'}})
+    for p in people:
+        v = client.get(f'/api/state?pin={pin}&secret={p["secret"]}').json()['round']['private_value']
+        submit(client, pin, p, {'bid': v // 2})
+    advance(client, pin)
+    sm = admin_state(client, pin)['round']['summary']
+    assert stats_of(sm)['Bids as % of valuations'] == pytest.approx(50, abs=1.5)
+    assert len(sm['chart']['points']) == 4 and [l['label'] for l in sm['chart']['lines']] == ['Bid = valuation', 'Equilibrium bid']

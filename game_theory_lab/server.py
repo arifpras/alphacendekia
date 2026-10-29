@@ -3,7 +3,7 @@ Run: pip install -r requirements.txt && python server.py
 """
 import os, json, uuid, time, random, sqlite3, secrets, csv, io, math
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -37,15 +37,24 @@ def init():
  with db() as c:
   c.executescript('''CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,pin TEXT UNIQUE,created TEXT,round_num INTEGER DEFAULT 0);
   CREATE TABLE IF NOT EXISTS participants(id TEXT PRIMARY KEY,session_id TEXT,label TEXT,secret TEXT UNIQUE,joined TEXT,nickname TEXT,active INTEGER DEFAULT 1);
-  CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,session_id TEXT,num INTEGER,game TEXT,phase TEXT,config TEXT,layout TEXT,started TEXT,finished TEXT);
+  CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,session_id TEXT,num INTEGER,game TEXT,phase TEXT,config TEXT,layout TEXT,started TEXT,finished TEXT,time_limit INTEGER DEFAULT 0,deadline TEXT);
   CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY AUTOINCREMENT,round_id TEXT,participant_id TEXT,phase TEXT,action TEXT,created TEXT, UNIQUE(round_id,participant_id,phase));
   CREATE TABLE IF NOT EXISTS outcomes(round_id TEXT,participant_id TEXT,points REAL,details TEXT,PRIMARY KEY(round_id,participant_id));''')
   # Databases created by earlier versions stored the nickname in `label` and had no nickname/active columns.
   cols={x['name'] for x in rows(c,'PRAGMA table_info(participants)')}
   if 'nickname' not in cols: c.execute('ALTER TABLE participants ADD COLUMN nickname TEXT')
   if 'active' not in cols: c.execute('ALTER TABLE participants ADD COLUMN active INTEGER DEFAULT 1')
+  cols={x['name'] for x in rows(c,'PRAGMA table_info(rounds)')}
+  if 'time_limit' not in cols: c.execute('ALTER TABLE rounds ADD COLUMN time_limit INTEGER DEFAULT 0')
+  if 'deadline' not in cols: c.execute('ALTER TABLE rounds ADD COLUMN deadline TEXT')
 
+MAX_TIME_LIMIT = 900
+GRACE_SECONDS = 1  # absorbs network delay for a click made as the countdown hits zero
 def now(): return datetime.now(timezone.utc).isoformat()
+def deadline_in(seconds): return (datetime.now(timezone.utc)+timedelta(seconds=seconds)).isoformat() if seconds else None
+def seconds_left(r):
+ if not r.get('deadline'): return None
+ return max(0.0,(datetime.fromisoformat(r['deadline'])-datetime.now(timezone.utc)).total_seconds())
 def uid(): return uuid.uuid4().hex[:16]
 def rows(c,q,args=()): return [dict(x) for x in c.execute(q,args).fetchall()]
 def one(c,q,args=()):
@@ -108,6 +117,7 @@ class Start(BaseModel):
  pin:str
  game:str
  config:dict=Field(default_factory=dict)
+ time_limit:int=0  # seconds per phase; 0 = no limit
 class Join(BaseModel):
  pin:str
  nickname:str=''
@@ -179,7 +189,8 @@ def start(x:Start,request:Request):
   config=sanitize_config(x.game,x.config)
   layout=layout_for(x.game,people)
   num=s['round_num']+1;rid=uid()
-  c.execute('INSERT INTO rounds VALUES(?,?,?,?,?,?,?,?,?)',(rid,s['id'],num,x.game,'propose' if x.game=='ultimatum' else 'choose',json.dumps(config),json.dumps(layout),now(),None))
+  limit=min(max(int(x.time_limit),0),MAX_TIME_LIMIT)
+  c.execute('INSERT INTO rounds(id,session_id,num,game,phase,config,layout,started,finished,time_limit,deadline) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(rid,s['id'],num,x.game,'propose' if x.game=='ultimatum' else 'choose',json.dumps(config),json.dumps(layout),now(),None,limit,deadline_in(limit)))
   c.execute('UPDATE sessions SET round_num=? WHERE id=?',(num,s['id']))
   return {'round':num,'game':x.game}
 
@@ -210,7 +221,8 @@ def validate_action(c,r,pid,a):
 def submit(x:Submit):
  with db() as c:
   c.execute('BEGIN IMMEDIATE')
-  s=session(c,x.pin);p=participant(c,x.secret,x.pin);r=current(c,s)
+  s=session(c,x.pin);p=participant(c,x.secret,x.pin);phase_before=(current(c,s) or {}).get('phase');r=expire(c,s)
+  if r and r['phase']!=phase_before:c.commit();raise HTTPException(409,'Time is up for this stage')
   if not r or r['phase']=='finished':raise HTTPException(409,'No active round')
   act=validate_action(c,r,p['id'],x.action)
   c.execute('INSERT INTO decisions(round_id,participant_id,phase,action,created) VALUES(?,?,?,?,?) ON CONFLICT(round_id,participant_id,phase) DO UPDATE SET action=excluded.action,created=excluded.created',(r['id'],p['id'],r['phase'],json.dumps(act),now()))
@@ -233,11 +245,24 @@ def advance(request:Request,pin:str):
  with db() as c:
   c.execute('BEGIN IMMEDIATE');s=session(c,pin);r=current(c,s)
   if not r or r['phase']=='finished':raise HTTPException(409,'No active round')
-  if r['game']=='ultimatum' and r['phase']=='propose':
-   c.execute("UPDATE rounds SET phase='responder' WHERE id=?",(r['id'],))
-   return {'phase':'responder'}
-  finish_round(c,r)
-  return {'phase':'finished'}
+  return {'phase':step(c,r)}
+
+def step(c,r):
+ """Move r to its next phase (Ultimatum responders, or finished) and return that phase."""
+ if r['game']=='ultimatum' and r['phase']=='propose':
+  c.execute("UPDATE rounds SET phase='responder',deadline=? WHERE id=?",(deadline_in(r['time_limit'] or 0),r['id']))
+  return 'responder'
+ finish_round(c,r)
+ return 'finished'
+
+def expire(c,s):
+ """Advance the current round if its time is up. Call inside BEGIN IMMEDIATE; returns the current round."""
+ r=current(c,s)
+ if r and r['phase']!='finished' and r.get('deadline') and datetime.now(timezone.utc)>datetime.fromisoformat(r['deadline'])+timedelta(seconds=GRACE_SECONDS):
+  step(c,r);r=current(c,s)
+ return r
+
+def due(r): return bool(r and r['phase']!='finished' and r.get('deadline') and seconds_left(r)==0)
 
 def finish_round(c,r):
  game=r['game'];cfg=json.loads(r['config']);lay=json.loads(r['layout'])
@@ -286,7 +311,113 @@ def finish_round(c,r):
   total=sum(v['quantity'] for v in d.values());price=max(0,cfg['intercept']-cfg['slope']*total)
   for pid,v in d.items():add(pid,(price-cfg['cost'])*v['quantity'],{'quantity':v['quantity'],'market_quantity':total,'market_price':price,'marginal_cost':cfg['cost']})
  for pid,o in result.items():c.execute('INSERT INTO outcomes VALUES(?,?,?,?)',(r['id'],pid,o['points'],json.dumps(o['detail'])))
- c.execute("UPDATE rounds SET phase='finished',finished=? WHERE id=?",(now(),r['id']))
+ c.execute("UPDATE rounds SET phase='finished',finished=?,deadline=NULL WHERE id=?",(now(),r['id']))
+
+def played(c,r):
+ """Decisions from assigned players in the round's playing phase (Ultimatum: the responders'), also after it finished."""
+ inround=players(c,r);return {p:v for p,v in get_choices(c,r,'responder' if r['game']=='ultimatum' else 'choose').items() if p in inround}
+
+def pct(a,b): return round(100*a/b,1) if b else None
+def avg(xs): return round(sum(xs)/len(xs),2) if xs else None
+def bins(values,edges,labels):
+ """Count values into bins; edges are inclusive upper bounds, one per label."""
+ out=[{'label':l,'value':0} for l in labels]
+ for v in values:
+  for i,e in enumerate(edges):
+   if v<=e:out[i]['value']+=1;break
+ return out
+
+def headline(c,r):
+ """One number per round for the trend chart, or None if nobody played."""
+ g=r['game'];cfg=json.loads(r['config']);inround=players(c,r);d=played(c,r)
+ if g=='ultimatum':d={p:v for p,v in get_choices(c,r,'propose').items() if p in inround}
+ if not d:return None
+ if g=='prisoner':return pct(sum(v['choice']=='C' for v in d.values()),len(d))
+ if g=='beauty':return avg([v['guess'] for v in d.values()])
+ if g=='public':return pct(avg([v['contribution'] for v in d.values()]),cfg['endowment'])
+ if g=='ultimatum':return pct(avg([v['offer'] for v in d.values()]),cfg['endowment'])
+ if g=='auction':
+  lay=json.loads(r['layout']);return pct(sum(v['bid'] for v in d.values()),sum(lay['values'][p] for p in d))
+ if g=='trading':
+  return avg([o['details']['transaction_price'] for o in outcome_rows(c,r) if o['details'].get('role')=='buyer' and o['details'].get('traded')])
+ if g=='oligopoly':return sum(v['quantity'] for v in d.values())
+
+TREND_LABEL={'prisoner':'% who cooperated','beauty':'Average guess','public':'Average contribution (% of endowment)','ultimatum':'Average offer (% of total)','auction':'Bids as % of valuations','trading':'Average trade price','oligopoly':'Total quantity'}
+
+def outcome_rows(c,r): return [{**o,'details':json.loads(o['details'])} for o in rows(c,'SELECT * FROM outcomes WHERE round_id=?',(r['id'],))]
+
+def summary(c,r):
+ """Class-level results of a finished round, for the instructor's projector view. No identities."""
+ g=r['game'];cfg=json.loads(r['config']);lay=json.loads(r['layout']);inround=players(c,r)
+ d=played(c,r)
+ out={'stats':[],'chart':None,'prediction':'','trend':None}
+ stat=lambda label,value,unit='':out['stats'].append({'label':label,'value':value,'unit':unit})
+ if g=='prisoner':
+  pairs=[(d[a]['choice'],d[b]['choice']) for a,b in lay['pairs'] if a in d and b in d]
+  coop=sum(v['choice']=='C' for v in d.values())
+  stat('Cooperated',pct(coop,len(d)),'%');stat('Pairs completed',len(pairs))
+  stat('Both cooperated',sum(p==('C','C') for p in pairs));stat('Both defected',sum(p==('D','D') for p in pairs))
+  out['chart']={'type':'bars','title':'Pairs by outcome','x':'Outcome','y':'Pairs','bars':[{'label':'Both cooperated','value':sum(p==('C','C') for p in pairs)},{'label':'One defected','value':sum(set(p)=={'C','D'} for p in pairs)},{'label':'Both defected','value':sum(p==('D','D') for p in pairs)}]}
+  out['prediction']=f"Defecting is the dominant strategy, so theory predicts both defect ({cfg['dd']:g} each) even though both cooperating pays {cfg['cc']:g} each."
+ elif g=='beauty':
+  guesses=[v['guess'] for v in d.values()]
+  if guesses:
+   a=sum(guesses)/len(guesses);t=cfg['fraction']*a;best=min(abs(x-t) for x in guesses);win=sorted({x for x in guesses if abs(abs(x-t)-best)<1e-8})
+   stat('Average guess',round(a,2));stat('Target',round(t,2));stat('Winning guess',', '.join(map(str,win)));stat('Guesses',len(guesses))
+   out['chart']={'type':'bars','title':'Guesses','x':'Guess','y':'Students','bars':bins(guesses,[9,19,29,39,49,59,69,79,89,100],['0–9','10–19','20–29','30–39','40–49','50–59','60–69','70–79','80–89','90–100']),'marker':{'pos':min(t,99.99)/10,'label':f'Target {t:.1f}'}}
+  out['prediction']='Repeated reasoning ("others will guess lower, so I should guess lower still") leads to the Nash equilibrium of 0.' if cfg['fraction']<1 else ''
+ elif g=='public':
+  E=cfg['endowment'];cs=[v['contribution'] for v in d.values()]
+  if cs:
+   stat('Average contribution',pct(avg(cs),E),'% of endowment');stat('Gave nothing',sum(x==0 for x in cs));stat('Gave everything',sum(x==E for x in cs))
+   pts=[o['points'] for o in outcome_rows(c,r) if 'contribution' in o['details']];stat('Average points',avg(pts))
+   q=lambda f:E*f
+   out['chart']={'type':'bars','title':'Contributions','x':'Points contributed','y':'Students','bars':bins(cs,[0,q(.25),q(.5),q(.75),E-1e-9,E],['0',f'1–{q(.25):g}',f'{q(.25)+1:g}–{q(.5):g}',f'{q(.5)+1:g}–{q(.75):g}',f'{q(.75)+1:g}–{E-1:g}',f'{E:g} (all)'])}
+  sizes=[len(x) for x in lay['groups']];m=cfg['multiplier']
+  out['prediction']=(f"Each point contributed returns {m:g} ÷ group size (about {m/ (sum(sizes)/len(sizes)):.2f}) to the giver, so the selfish prediction is 0. Everyone giving everything would pay {m*E:g} each." if sizes and m<min(sizes) else '')
+ elif g=='ultimatum':
+  E=cfg['endowment'];offers=get_choices(c,r,'propose');resp=get_choices(c,r,'responder')
+  pairs=[(offers[a]['offer'],resp[b]['accept']) for a,b in lay['pairs'] if a in offers and b in resp]
+  if offers:
+   os_=[v['offer'] for p,v in offers.items() if p in inround];stat('Average offer',pct(avg(os_),E),'% of total')
+  if pairs:
+   stat('Accepted',pct(sum(a for _,a in pairs),len(pairs)),'%');rej=[o for o,a in pairs if not a];stat('Highest rejected offer',max(rej) if rej else '—')
+   edges=[E*.1,E*.2,E*.3,E*.4,E*.5-1e-9,E*.5,E];labels=[f'0–{E*.1:g}',f'{E*.1+1:g}–{E*.2:g}',f'{E*.2+1:g}–{E*.3:g}',f'{E*.3+1:g}–{E*.4:g}',f'{E*.4+1:g}–{E*.5-1:g}',f'{E*.5:g} (even)',f'over {E*.5:g}']
+   acc=bins([o for o,a in pairs if a],edges,labels);rj=bins([o for o,a in pairs if not a],edges,labels)
+   out['chart']={'type':'stacked','title':'Offers and responses','x':'Offer','y':'Pairs','series':['Accepted','Rejected'],'bars':[{'label':x['label'],'values':[x['value'],y['value']]} for x,y in zip(acc,rj)]}
+  out['prediction']='If only points mattered, responders accept any positive offer, so proposers offer the minimum. Offers near half and rejected low offers show concern for fairness.'
+ elif g=='auction':
+  bids=[(lay['values'][p],v['bid']) for p,v in d.items()]
+  won=[o for o in outcome_rows(c,r) if o['details'].get('winner')]
+  if bids:
+   stat('Bids as % of valuations',pct(sum(b for _,b in bids),sum(v for v,_ in bids)),'%')
+   if won:w=won[0]['details'];stat('Price paid',w['price']);stat("Winner's valuation",w['valuation'])
+   stat('Highest valuation went to winner','yes' if won and won[0]['details']['valuation']==max(v for v,_ in bids) else 'no')
+   n=len(bids)
+   out['chart']={'type':'scatter','title':'Bids against valuations','x':'Valuation','y':'Bid','points':[{'x':v,'y':b} for v,b in bids],'lines':[{'label':'Bid = valuation','from':[40,40],'to':[100,100]}]+([{'label':'Equilibrium bid','from':[40,40],'to':[100,40+(n-1)/n*60]}] if cfg['format']=='first' and n>1 else [])}
+  out['prediction']=(f"With {len(bids)} bidders and valuations spread evenly from 40 to 100, a risk-neutral bidder bids 40 + {len(bids)-1}/{len(bids)} × (valuation − 40): below their valuation." if cfg['format']=='first' and len(bids)>1 else 'In a second-price auction, bidding exactly your valuation is the dominant strategy.')
+ elif g=='trading':
+  buyers=sorted([lay['values'][p] for p in inround if lay['roles'].get(p)=='buyer'],reverse=True);sellers=sorted(lay['values'][p] for p in inround if lay['roles'].get(p)=='seller')
+  q=sum(1 for b,s_ in zip(buyers,sellers) if b>=s_);maxs=sum(b-s_ for b,s_ in zip(buyers,sellers) if b>=s_)
+  outs=outcome_rows(c,r);prices=sorted(o['details']['transaction_price'] for o in outs if o['details'].get('role')=='buyer' and o['details'].get('traded'))
+  got=sum(o['points'] for o in outs)
+  stat('Trades',len(prices));stat('Average price',avg(prices) if prices else '—');stat('Efficiency',pct(got,maxs),'% of possible gains')
+  if q:lo=max(sellers[q-1],buyers[q] if q<len(buyers) else 0);hi=min(buyers[q-1],sellers[q] if q<len(sellers) else 10**9);stat('Predicted price',f'{lo:g}–{hi:g}' if lo!=hi else f'{lo:g}')
+  out['chart']={'type':'steps','title':'Supply, demand and trade prices','x':'Units','y':'Price','series':['Demand (buyer values)','Supply (seller costs)'],'demand':buyers,'supply':sellers,'prices':prices}
+  out['prediction']=f'Supply and demand cross at {q} trade{"s" if q!=1 else ""}; prices near that crossing use up all the possible gains.' if q else 'No buyer value exceeded any seller cost this round, so no trade could create value.'
+ elif g=='oligopoly':
+  qs=[v['quantity'] for v in d.values()];a,b,k=cfg['intercept'],cfg['slope'],cfg['cost'];n=len(qs)
+  if qs:
+   tot=sum(qs);p=max(0,a-b*tot);stat('Total quantity',tot);stat('Market price',round(p,2));stat('Average profit',avg([(p-k)*x for x in qs]))
+   if a>k:
+    qn=(a-k)/(b*(n+1));stat('Nash quantity per firm',round(qn,1))
+    out['prediction']=f"Cournot–Nash: each of the {n} firms produces {qn:.1f} (total {n*qn:.1f}, price {a-b*n*qn:.1f}). A monopoly would produce {(a-k)/(2*b):.1f} in total at price {(a+k)/2:.1f}; perfect competition would push price to cost ({k:g})."
+   mx=int(cfg['max_quantity']);step_=max(1,math.ceil(mx/10));edges=[min(mx,i*step_+step_-1) for i in range(math.ceil((mx+1)/step_))]
+   out['chart']={'type':'bars','title':'Quantities chosen','x':'Units','y':'Firms','bars':bins(qs,edges,[f'{i*step_}–{e}' if e>i*step_ else f'{e}' for i,e in enumerate(edges)]),'marker':({'pos':min((a-k)/(b*(n+1)),mx)/step_,'label':f'Nash {(a-k)/(b*(n+1)):.1f}'} if a>k else None)}
+ trend=[{'round':x['num'],'value':headline(c,x)} for x in rows(c,"SELECT * FROM rounds WHERE session_id=? AND game=? AND phase='finished' AND num<=? ORDER BY num",(r['session_id'],g,r['num']))]
+ trend=[t for t in trend if t['value'] is not None]
+ if len(trend)>=2:out['trend']={'label':TREND_LABEL[g],'points':trend}
+ return out
 
 @app.get('/api/state')
 def state(request:Request,pin:str,secret:str=''):
@@ -298,9 +429,10 @@ def state(request:Request,pin:str,secret:str=''):
   data={'pin':pin,'participants':len(people),'max_participants':MAX_STUDENTS,'games':GAME_NAMES}
   if is_admin:data['participants_private']=people
   r=current(c,s)
+  if due(r):c.execute('BEGIN IMMEDIATE');r=expire(c,s);c.commit()
   if not r:return {**data,'round':None}
   layout=json.loads(r['layout']);cfg=json.loads(r['config']);st=stats(c,r)
-  info={'number':r['num'],'game':r['game'],'name':GAME_NAMES[r['game']],'phase':r['phase'],'config':cfg,'submitted':st['submitted'],'expected':st['expected']}
+  info={'number':r['num'],'game':r['game'],'name':GAME_NAMES[r['game']],'phase':r['phase'],'config':cfg,'submitted':st['submitted'],'expected':st['expected'],'time_limit':r['time_limit'] or 0,'seconds_left':seconds_left(r)}
   if is_admin:
    if r['phase']=='finished':
     # Include removed students too, so a finished round's table stays complete.
@@ -308,6 +440,7 @@ def state(request:Request,pin:str,secret:str=''):
     outcomes=rows(c,'SELECT * FROM outcomes WHERE round_id=?',(r['id'],))
     info['results']=[{'participant':everyone.get(z['participant_id'],{}).get('label','Unknown'),'nickname':everyone.get(z['participant_id'],{}).get('nickname'),'points':z['points'],'detail':json.loads(z['details'])} for z in outcomes]
    info['waiting_count']=len(layout['waiting'])
+   if r['phase']=='finished':info['summary']=summary(c,r)
   else:
    pid=p['id']; info['in_round']=pid in players(c,r)
    info['resting']=pid in layout['waiting'];info['role']=layout['roles'].get(pid)
