@@ -313,6 +313,9 @@ def state(request:Request,pin:str,secret:str=''):
    info['resting']=pid in layout['waiting'];info['role']=layout['roles'].get(pid)
    info['private_value']=layout['values'].get(pid)
    info['submitted_by_me']=pid in get_choices(c,r)
+   # Sizes for the student's "How to play" text; counts only, never who the others are.
+   info['players_in_round']=len(players(c,r)-set(layout['waiting']))
+   info['group_size']=next((len(g) for g in layout['groups'] if pid in g),None)
    if r['game']=='ultimatum' and r['phase']=='responder' and info['role']=='responder':
     proposals=get_choices(c,r,'propose')
     for pair in layout['pairs']:

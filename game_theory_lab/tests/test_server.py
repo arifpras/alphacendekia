@@ -182,3 +182,16 @@ def test_old_database_is_migrated(tmp_path, monkeypatch):
     cl = TestClient(server.app)
     assert cl.get('/api/state?pin=123456&secret=sec1').status_code == 200
     assert join(cl, '123456')['label'] == 'Participant 02'
+
+
+def test_student_state_has_sizes_for_rules_text(client):
+    pin = new_session(client)
+    people = [join(client, pin) for _ in range(6)]
+    start(client, pin, 'public')
+    r = client.get(f'/api/state?pin={pin}&secret={people[0]["secret"]}').json()['round']
+    assert r['players_in_round'] == 6 and r['group_size'] == 3
+    advance(client, pin)
+    start(client, pin, 'prisoner')
+    join(client, pin)  # late joiner, not counted
+    r = client.get(f'/api/state?pin={pin}&secret={people[0]["secret"]}').json()['round']
+    assert r['players_in_round'] == 6 and r['group_size'] is None
