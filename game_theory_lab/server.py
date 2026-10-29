@@ -12,7 +12,8 @@ from starlette.staticfiles import StaticFiles
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get('GTL_DB', str(ROOT / 'game_lab.db')))
-ADMIN_PASSWORD = os.environ.get('GTL_ADMIN_PASSWORD', 'classroom-demo')
+# No well-known default: without GTL_ADMIN_PASSWORD a random password is generated and printed at startup.
+ADMIN_PASSWORD = os.environ.get('GTL_ADMIN_PASSWORD') or secrets.token_urlsafe(9)
 MAX_STUDENTS = 20
 GAME_NAMES = {'prisoner':'Prisoner’s Dilemma','beauty':'Keynesian Beauty Contest','public':'Public Goods','ultimatum':'Ultimatum','auction':'Sealed-Bid Auction','trading':'Market Trading','oligopoly':'Cournot Competition'}
 app=FastAPI(title='Game Theory Lab')
@@ -26,7 +27,7 @@ def db():
  try:
   yield c
   if c.in_transaction: c.commit()
- except:
+ except BaseException:
   if c.in_transaction: c.rollback()
   raise
  finally: c.close()
@@ -35,20 +36,28 @@ def init():
  DB.parent.mkdir(parents=True,exist_ok=True)
  with db() as c:
   c.executescript('''CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,pin TEXT UNIQUE,created TEXT,round_num INTEGER DEFAULT 0);
-  CREATE TABLE IF NOT EXISTS participants(id TEXT PRIMARY KEY,session_id TEXT,label TEXT,secret TEXT UNIQUE,joined TEXT);
+  CREATE TABLE IF NOT EXISTS participants(id TEXT PRIMARY KEY,session_id TEXT,label TEXT,secret TEXT UNIQUE,joined TEXT,nickname TEXT,active INTEGER DEFAULT 1);
   CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,session_id TEXT,num INTEGER,game TEXT,phase TEXT,config TEXT,layout TEXT,started TEXT,finished TEXT);
   CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY AUTOINCREMENT,round_id TEXT,participant_id TEXT,phase TEXT,action TEXT,created TEXT, UNIQUE(round_id,participant_id,phase));
   CREATE TABLE IF NOT EXISTS outcomes(round_id TEXT,participant_id TEXT,points REAL,details TEXT,PRIMARY KEY(round_id,participant_id));''')
-init()
+  # Databases created by earlier versions stored the nickname in `label` and had no nickname/active columns.
+  cols={x['name'] for x in rows(c,'PRAGMA table_info(participants)')}
+  if 'nickname' not in cols: c.execute('ALTER TABLE participants ADD COLUMN nickname TEXT')
+  if 'active' not in cols: c.execute('ALTER TABLE participants ADD COLUMN active INTEGER DEFAULT 1')
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def uid(): return uuid.uuid4().hex[:16]
 def rows(c,q,args=()): return [dict(x) for x in c.execute(q,args).fetchall()]
 def one(c,q,args=()):
  r=c.execute(q,args).fetchone();return dict(r) if r else None
+init()
+
+def password_ok(value):
+ # Compare bytes: compare_digest raises TypeError on non-ASCII str.
+ return bool(value) and secrets.compare_digest(value.encode(),ADMIN_PASSWORD.encode())
 
 def auth(request):
- if not secrets.compare_digest(request.headers.get('x-admin-password',''),ADMIN_PASSWORD): raise HTTPException(401,'Incorrect instructor password')
+ if not password_ok(request.headers.get('x-admin-password','')): raise HTTPException(401,'Incorrect instructor password')
 
 def session(c,pin):
  s=one(c,'SELECT * FROM sessions WHERE pin=?',(pin,))
@@ -56,22 +65,31 @@ def session(c,pin):
  return s
 
 def participant(c,secret,pin):
- p=one(c,'SELECT p.* FROM participants p JOIN sessions s ON s.id=p.session_id WHERE p.secret=? AND s.pin=?',(secret,pin))
+ p=one(c,'SELECT p.* FROM participants p JOIN sessions s ON s.id=p.session_id WHERE p.secret=? AND s.pin=? AND p.active=1',(secret,pin))
  if not p: raise HTTPException(401,'Join this session first')
  return p
 
 def current(c,s): return one(c,'SELECT * FROM rounds WHERE session_id=? ORDER BY num DESC LIMIT 1',(s['id'],))
 
+def active_ids(c,session_id): return {p['id'] for p in rows(c,'SELECT id FROM participants WHERE session_id=? AND active=1',(session_id,))}
+
+def players(c,r):
+ """Participants assigned to round r. Rounds stored by earlier versions have no list, so use who had joined by its start."""
+ lay=json.loads(r['layout'])
+ if 'players' in lay: return set(lay['players'])
+ return {p['id'] for p in rows(c,'SELECT id FROM participants WHERE session_id=? AND joined<=?',(r['session_id'],r['started']))}
+
 def layout_for(game, people):
  ids=[p['id'] for p in people];random.shuffle(ids)
- result={'roles':{},'groups':[],'pairs':[],'waiting':[],'values':{}}
+ result={'players':list(ids),'roles':{},'groups':[],'pairs':[],'waiting':[],'values':{}}
  if game in ('prisoner','ultimatum'):
   if len(ids)%2: result['waiting']=[ids.pop()]
   result['pairs']=[ids[i:i+2] for i in range(0,len(ids),2)]
   if game=='ultimatum':
    for x,y in result['pairs']: result['roles'][x]='proposer';result['roles'][y]='responder'
  elif game=='public':
-  n=len(ids); group_count=max(1,round(n/4)); sizes=[n//group_count+(i<n%group_count) for i in range(group_count)];offset=0
+  # Groups of about four; n/4 rounded half up (2-5 -> 1 group, 6-9 -> 2, 10-13 -> 3, ...).
+  n=len(ids); group_count=max(1,(n+2)//4); sizes=[n//group_count+(i<n%group_count) for i in range(group_count)];offset=0
   for k in sizes:result['groups'].append(ids[offset:offset+k]);offset+=k
  elif game=='auction':
   result['values']={pid:random.randint(40,100) for pid in ids}
@@ -79,6 +97,12 @@ def layout_for(game, people):
   result['roles']={pid:('buyer' if i<len(ids)//2 else 'seller') for i,pid in enumerate(ids)}
   result['values']={pid:(random.randint(60,110) if result['roles'][pid]=='buyer' else random.randint(20,70)) for pid in ids}
  return result
+
+def unit_of(lay,pid):
+ """Pair or group number (1-based) that pid belongs to, or None."""
+ for i,unit in enumerate(lay['pairs'] or lay['groups']):
+  if pid in unit: return i+1
+ return None
 
 class Start(BaseModel):
  pin:str
@@ -99,7 +123,7 @@ def sanitize_config(g,c):
   if k in out:
    if isinstance(out[k],(int,float)):
     try: v=float(v)
-    except:continue
+    except (TypeError,ValueError):continue
     if not math.isfinite(v): continue
     if k in ('endowment','multiplier','fraction','intercept','slope','max_quantity') and v<=0:continue
     if k=='cost' and v<0:continue
@@ -122,13 +146,25 @@ def create(request:Request):
 @app.post('/api/join')
 def join(x:Join):
  with db() as c:
+  # Lock so the class-size check and label numbering can't race with another join.
+  c.execute('BEGIN IMMEDIATE')
   s=session(c,x.pin)
-  if one(c,'SELECT count(*) n FROM participants WHERE session_id=?',(s['id'],))['n']>=MAX_STUDENTS:raise HTTPException(409,'Class is full (20 students)')
+  if len(active_ids(c,s['id']))>=MAX_STUDENTS:raise HTTPException(409,f'Class is full ({MAX_STUDENTS} students)')
   nickname=x.nickname.strip()[:30] or 'Student'
+  # Number over everyone who ever joined, so a removed student's label is never reused.
+  label='Participant '+str(one(c,'SELECT count(*) n FROM participants WHERE session_id=?',(s['id'],))['n']+1).zfill(2)
   pid=uid();secret=secrets.token_urlsafe(24)
-  c.execute('INSERT INTO participants VALUES(?,?,?,?,?)',(pid,s['id'],nickname,secret,now()))
-  label='Participant '+str(one(c,'SELECT count(*) n FROM participants WHERE session_id=?',(s['id'],))['n']).zfill(2)
+  c.execute('INSERT INTO participants(id,session_id,label,secret,joined,nickname,active) VALUES(?,?,?,?,?,?,1)',(pid,s['id'],label,secret,now(),nickname))
   return {'secret':secret,'label':label}
+
+@app.post('/api/remove')
+def remove(request:Request,pin:str,participant_id:str):
+ auth(request)
+ with db() as c:
+  c.execute('BEGIN IMMEDIATE');s=session(c,pin)
+  n=c.execute('UPDATE participants SET active=0 WHERE id=? AND session_id=?',(participant_id,s['id'])).rowcount
+  if not n:raise HTTPException(404,'Participant not found')
+  return {'ok':True}
 
 @app.post('/api/start')
 def start(x:Start,request:Request):
@@ -138,7 +174,7 @@ def start(x:Start,request:Request):
   c.execute('BEGIN IMMEDIATE')
   s=session(c,x.pin); prev=current(c,s)
   if prev and prev['phase']!='finished':raise HTTPException(409,'Finish the current round first')
-  people=rows(c,'SELECT id FROM participants WHERE session_id=?',(s['id'],))
+  people=rows(c,'SELECT id FROM participants WHERE session_id=? AND active=1',(s['id'],))
   if len(people)<2:raise HTTPException(400,'At least two students are needed')
   config=sanitize_config(x.game,x.config)
   layout=layout_for(x.game,people)
@@ -147,27 +183,24 @@ def start(x:Start,request:Request):
   c.execute('UPDATE sessions SET round_num=? WHERE id=?',(num,s['id']))
   return {'round':num,'game':x.game}
 
-def required_ids(r):
- lay=json.loads(r['layout']);excluded=set(lay['waiting'])
- if r['game']=='ultimatum':
-  role='proposer' if r['phase']=='propose' else 'responder'
-  return {p for p,v in lay['roles'].items() if v==role}
- return set(lay['roles']) if False else None
-
-def validate_action(r,pid,a):
+def validate_action(c,r,pid,a):
  g=r['game'];phase=r['phase']; cfg=json.loads(r['config']);lay=json.loads(r['layout'])
+ if pid not in players(c,r):raise HTTPException(400,'You joined after this round started; wait for the next round')
  if pid in lay['waiting']:raise HTTPException(400,'You are resting this round')
  if g=='ultimatum' and lay['roles'].get(pid)!=('proposer' if phase=='propose' else 'responder'):raise HTTPException(400,'Not your turn')
  def number(k,low,high,integer=False):
   v=a.get(k)
-  if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or v<low or v>high or (integer and int(v)!=v):raise HTTPException(400,f'{k} must be between {low} and {high}')
+  if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or v<low or v>high or (integer and int(v)!=v):raise HTTPException(400,f'{k} must be between {low:g} and {high:g}')
   return int(v) if integer else float(v)
  if g=='prisoner':
   if a.get('choice') not in ('C','D'):raise HTTPException(400,'Choose C or D')
   return {'choice':a['choice']}
  if g=='beauty':return {'guess':number('guess',0,100,True)}
  if g=='public':return {'contribution':number('contribution',0,cfg['endowment'],True)}
- if g=='ultimatum':return {'offer':number('offer',0,cfg['endowment'],True)} if phase=='propose' else {'accept':a.get('accept') is True}
+ if g=='ultimatum':
+  if phase=='propose':return {'offer':number('offer',0,cfg['endowment'],True)}
+  if not isinstance(a.get('accept'),bool):raise HTTPException(400,'Choose accept or reject')
+  return {'accept':a['accept']}
  if g=='auction':return {'bid':number('bid',0,200,True)}
  if g=='trading':return {'price':number('price',0,150,True)}
  if g=='oligopoly':return {'quantity':number('quantity',0,cfg['max_quantity'],True)}
@@ -178,8 +211,8 @@ def submit(x:Submit):
  with db() as c:
   c.execute('BEGIN IMMEDIATE')
   s=session(c,x.pin);p=participant(c,x.secret,x.pin);r=current(c,s)
-  if not r or r['phase'] in ('finished','revealed'):raise HTTPException(409,'No active round')
-  act=validate_action(r,p['id'],x.action)
+  if not r or r['phase']=='finished':raise HTTPException(409,'No active round')
+  act=validate_action(c,r,p['id'],x.action)
   c.execute('INSERT INTO decisions(round_id,participant_id,phase,action,created) VALUES(?,?,?,?,?) ON CONFLICT(round_id,participant_id,phase) DO UPDATE SET action=excluded.action,created=excluded.created',(r['id'],p['id'],r['phase'],json.dumps(act),now()))
   return {'ok':True}
 
@@ -187,9 +220,10 @@ def get_choices(c,r,phase=None):
  return {d['participant_id']:json.loads(d['action']) for d in rows(c,'SELECT * FROM decisions WHERE round_id=? AND phase=?',(r['id'],phase or r['phase']))}
 
 def stats(c,r):
- lay=json.loads(r['layout']);allids={p['id'] for p in rows(c,'SELECT id FROM participants WHERE session_id=?',(r['session_id'],))}
- required=allids-set(lay['waiting'])
+ lay=json.loads(r['layout'])
+ required=players(c,r)-set(lay['waiting'])
  if r['game']=='ultimatum':required={p for p,role in lay['roles'].items() if role==('proposer' if r['phase']=='propose' else 'responder')}
+ required&=active_ids(c,r['session_id'])  # removed students are no longer waited for
  choices=get_choices(c,r)
  return {'submitted':len(required & set(choices)),'expected':len(required),'all_submitted':required<=set(choices)}
 
@@ -206,8 +240,10 @@ def advance(request:Request,pin:str):
   return {'phase':'finished'}
 
 def finish_round(c,r):
- game=r['game'];cfg=json.loads(r['config']);lay=json.loads(r['layout']);d=get_choices(c,r)
- result={};ids=[p['id'] for p in rows(c,'SELECT id FROM participants WHERE session_id=?',(r['session_id'],))]
+ game=r['game'];cfg=json.loads(r['config']);lay=json.loads(r['layout'])
+ # Only decisions from assigned players count (guards rounds stored before submissions were checked).
+ inround=players(c,r);d={p:v for p,v in get_choices(c,r).items() if p in inround}
+ result={}
  def add(pid,points,detail):result[pid]={'points':round(float(points),3),'detail':detail}
  for pid in lay['waiting']:add(pid,0,{'resting':True})
  if game=='prisoner':
@@ -253,12 +289,12 @@ def finish_round(c,r):
  c.execute("UPDATE rounds SET phase='finished',finished=? WHERE id=?",(now(),r['id']))
 
 @app.get('/api/state')
-def state(pin:str,secret:str='',admin_password:str=''):
+def state(request:Request,pin:str,secret:str=''):
  with db() as c:
-  s=session(c,pin);is_admin=bool(admin_password) and secrets.compare_digest(admin_password,ADMIN_PASSWORD)
+  s=session(c,pin);is_admin=password_ok(request.headers.get('x-admin-password',''))
   p=None if is_admin else (participant(c,secret,pin) if secret else None)
   if not is_admin and not p:raise HTTPException(401,'Authentication required')
-  people=rows(c,'SELECT id,label FROM participants WHERE session_id=? ORDER BY joined,id',(s['id'],))
+  people=rows(c,'SELECT id,label,nickname FROM participants WHERE session_id=? AND active=1 ORDER BY joined,id',(s['id'],))
   data={'pin':pin,'participants':len(people),'max_participants':MAX_STUDENTS,'games':GAME_NAMES}
   if is_admin:data['participants_private']=people
   r=current(c,s)
@@ -267,10 +303,14 @@ def state(pin:str,secret:str='',admin_password:str=''):
   info={'number':r['num'],'game':r['game'],'name':GAME_NAMES[r['game']],'phase':r['phase'],'config':cfg,'submitted':st['submitted'],'expected':st['expected']}
   if is_admin:
    if r['phase']=='finished':
-    outcomes=rows(c,'SELECT * FROM outcomes WHERE round_id=?',(r['id'],));info['results']=[{'participant':next((x['label'] for x in people if x['id']==z['participant_id']),'Unknown'),'points':z['points'],'detail':json.loads(z['details'])} for z in outcomes]
+    # Include removed students too, so a finished round's table stays complete.
+    everyone={x['id']:x for x in rows(c,'SELECT id,label,nickname FROM participants WHERE session_id=?',(s['id'],))}
+    outcomes=rows(c,'SELECT * FROM outcomes WHERE round_id=?',(r['id'],))
+    info['results']=[{'participant':everyone.get(z['participant_id'],{}).get('label','Unknown'),'nickname':everyone.get(z['participant_id'],{}).get('nickname'),'points':z['points'],'detail':json.loads(z['details'])} for z in outcomes]
    info['waiting_count']=len(layout['waiting'])
   else:
-   pid=p['id']; info['resting']=pid in layout['waiting'];info['role']=layout['roles'].get(pid)
+   pid=p['id']; info['in_round']=pid in players(c,r)
+   info['resting']=pid in layout['waiting'];info['role']=layout['roles'].get(pid)
    info['private_value']=layout['values'].get(pid)
    info['submitted_by_me']=pid in get_choices(c,r)
    if r['game']=='ultimatum' and r['phase']=='responder' and info['role']=='responder':
@@ -284,25 +324,35 @@ def state(pin:str,secret:str='',admin_password:str=''):
   return data
 
 @app.get('/api/history')
-def history(pin:str,admin_password:str):
- if not secrets.compare_digest(admin_password,ADMIN_PASSWORD):raise HTTPException(401,'Incorrect password')
+def history(request:Request,pin:str):
+ auth(request)
  with db() as c:
   s=session(c,pin);return {'rounds':rows(c,'SELECT num,game,phase,started,finished FROM rounds WHERE session_id=? ORDER BY num',(s['id'],))}
 
 @app.get('/api/export')
-def export(pin:str,admin_password:str):
- if not secrets.compare_digest(admin_password,ADMIN_PASSWORD):raise HTTPException(401,'Incorrect password')
+def export(request:Request,pin:str):
+ auth(request)
  with db() as c:
   s=session(c,pin)
-  data=rows(c,'''SELECT r.num,r.game,r.phase AS round_phase,r.config,r.layout,d.participant_id,d.phase AS decision_phase,d.action,d.created,o.points,o.details
-  FROM rounds r JOIN decisions d ON r.id=d.round_id LEFT JOIN outcomes o ON o.round_id=r.id AND o.participant_id=d.participant_id
-  WHERE r.session_id=? ORDER BY r.num,d.participant_id,d.phase''',(s['id'],))
-  f=io.StringIO();writer=csv.writer(f);writer.writerow(['round','game','participant_id','phase','decision_json','payoff','outcome_json','config_json','timestamp'])
-  for r in data:writer.writerow([r['num'],r['game'],r['participant_id'],r['decision_phase'],r['action'],r['points'],r['details'],r['config'],r['created']])
+  f=io.StringIO();writer=csv.writer(f);writer.writerow(['round','game','participant_id','phase','decision_json','payoff','outcome_json','config_json','timestamp','role','pair_or_group','private_value'])
+  for r in rows(c,'SELECT * FROM rounds WHERE session_id=? ORDER BY num',(s['id'],)):
+   lay=json.loads(r['layout'])
+   outcomes={o['participant_id']:o for o in rows(c,'SELECT * FROM outcomes WHERE round_id=?',(r['id'],))}
+   decided=set()
+   def write(pid,d):
+    o=outcomes.get(pid,{})
+    role='resting' if pid in lay['waiting'] else lay['roles'].get(pid,'')
+    writer.writerow([r['num'],r['game'],pid,d['phase'] if d else '',d['action'] if d else '',o.get('points'),o.get('details'),r['config'],d['created'] if d else '',role,unit_of(lay,pid) or '',lay['values'].get(pid,'')])
+   for d in rows(c,'SELECT * FROM decisions WHERE round_id=? ORDER BY participant_id,phase',(r['id'],)):
+    write(d['participant_id'],d);decided.add(d['participant_id'])
+   # Resting players have an outcome but no decision; keep them so the round's assignment is complete.
+   for pid in sorted(set(outcomes)-decided):write(pid,None)
   f.seek(0)
   return StreamingResponse(iter([f.getvalue()]),media_type='text/csv',headers={'Content-Disposition':f'attachment; filename="game-theory-{pin}.csv"'})
 
 if __name__=='__main__':
  import uvicorn
- print('Instructor: http://127.0.0.1:8000 | Password:',ADMIN_PASSWORD)
- uvicorn.run(app,host=os.environ.get('HOST','0.0.0.0'),port=int(os.environ.get('PORT',8000)))
+ port=int(os.environ.get('PORT',8000))
+ if os.environ.get('GTL_ADMIN_PASSWORD'):print(f'Instructor: http://127.0.0.1:{port} (password from GTL_ADMIN_PASSWORD)')
+ else:print(f'Instructor: http://127.0.0.1:{port} | GTL_ADMIN_PASSWORD not set; generated password for this run:',ADMIN_PASSWORD)
+ uvicorn.run(app,host=os.environ.get('HOST','0.0.0.0'),port=port)
