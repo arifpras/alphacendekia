@@ -7,11 +7,11 @@ A complete, small-class (2–20 participants) web app with instructor and studen
 1. Install Python 3.10+.
 2. In this folder, run `python -m pip install -r requirements.txt`.
 3. Set an instructor password: `export GTL_ADMIN_PASSWORD='your-strong-password'` (macOS/Linux) or `$env:GTL_ADMIN_PASSWORD='your-strong-password'` (PowerShell).
-4. Start: `python server.py`.
+4. Start: `python server.py`. If `GTL_ADMIN_PASSWORD` is not set, a random password is generated for that run and printed in the terminal.
 5. Instructor opens `http://localhost:8000`, creates a session, and shares the PIN.
 6. Students on the same Wi-Fi network visit `http://YOUR-LAPTOP-LAN-IP:8000` or use a cloud-deployed URL. Your firewall must allow incoming connections to port 8000.
 
-For internet-based play, deploy behind HTTPS using a Python-capable host and persistent storage. The database path is configurable through `GTL_DB`. Do not deploy the built-in classroom password or a public instance without HTTPS; tokens and exported responses need protection.
+For internet-based play, deploy behind HTTPS using a Python-capable host and persistent storage. The database path is configurable through `GTL_DB`. Always set `GTL_ADMIN_PASSWORD` for a deployment, and do not run a public instance without HTTPS; tokens and exported responses need protection.
 
 ## Games
 
@@ -25,25 +25,31 @@ For internet-based play, deploy behind HTTPS using a Python-capable host and per
 
 ## Instructor workflow
 
-Create class -> students join -> choose game -> start round -> wait for responses -> advance / close round -> review outcomes -> launch next round -> export CSV.
+Create class -> students join -> choose game and time limit -> start round -> wait for responses -> advance / close round -> review and project the class summary -> launch next round -> export CSV.
 
-The app keeps a record of decisions and computed payoffs across rounds. Participant nicknames are stored in a separate database table and are **not included in CSV exports**. CSV contains pseudonymous participant IDs. Student screens never reveal partner names or other students' decisions. Instructor sees private roster and outcome rows.
+**Time limit.** Each round can have a time limit per stage (30 s to 3 min, default 90 s, or none). Students and the instructor see a countdown. When it reaches zero the stage closes by itself: Ultimatum moves to the responder stage with a fresh countdown, and other games show results. Students who haven't submitted get no payoff for that round. The instructor can still close a stage early.
+
+**Class summary.** When a round finishes, the instructor sees a summary with no names: headline numbers, a chart (guess or contribution distribution, offers accepted vs rejected, bids against valuations, supply and demand with trade prices, quantities against the Nash prediction), what theory predicts, and a round-by-round trend when the same game has been played more than once. **Project class results** opens it full screen for the classroom projector (Esc to close).
+
+The app keeps a record of decisions and computed payoffs across rounds. Participant nicknames are stored only in the participants table and are **not included in CSV exports**. CSV contains pseudonymous participant IDs, plus each player's role, pair or group number and private value, so matching can be reconstructed. Resting players appear with an empty decision. Student screens never reveal partner names or other students' decisions. Instructor sees the private roster (label and name) and outcome rows, and can remove students who have left so rounds no longer wait for them.
 
 ## Important limitations / classroom safeguards
 
 - This is a usable **prototype**, not a security-audited research platform.
 - Only one instructor password is used (configured in the environment); session PIN is shareable.
-- Students should retain the same browser tab (or sessionStorage in the same tab) to keep their anonymous identity. They can refresh; opening a different device will create a different identity.
+- Students should retain the same browser tab (or sessionStorage in the same tab) to keep their anonymous identity. They can refresh (the PIN is kept in the page address); opening a different device will create a different identity.
 - In odd-sized paired rounds, one random participant rests. Assignment is randomized each round, **not guaranteed balanced across rounds**.
+- Students who join while a round is running wait and are included from the next round.
 - Instructor can close a round early. Missing decisions produce no payoff; results reflect received submissions only.
 - In Ultimatum, the instructor must wait for all proposers before moving to responder stage; otherwise unmatched responder offers may be absent.
-- Public Goods groups approximately four and can be larger for very small classes; group returns are shared equally including non-submitters, so close only after all participants have acted for clean outcomes.
+- Public Goods forms groups of about four (3–5 depending on class size; one group of up to 5 for classes under 6). The multiplier is not capped, so keep it between 1 and the group size for a social dilemma; group returns are shared equally including non-submitters, so close only after all participants have acted for clean outcomes.
 - Stored records are not automatically deleted. To reset data, stop server and remove `game_lab.db` (and any `-wal`/`-shm` files) or use a new `GTL_DB` file.
-- Instructor password is placed in a URL parameter for CSV/history/state requests; for production, replace with secure cookie-based sessions to avoid URL logging. Use HTTPS, or run only on a trusted classroom LAN.
-- No built-in timer, fixed-pair assignment, leaderboard, communication channel, or research-grade treatment randomization yet.
+- The instructor password is sent in a request header (never in URLs) and kept only in the open page. There is no rate limiting on password or PIN guesses; use HTTPS, or run only on a trusted classroom LAN.
+- No fixed-pair assignment, leaderboard, communication channel, or research-grade treatment randomization yet.
 
 ## Files
 
 - `server.py`: Python FastAPI backend, matching engine and payoff rules
 - `static/index.html`: responsive instructor/student UI
 - `requirements.txt`: Python dependencies
+- `tests/`: API tests; run `python -m pip install -r requirements-dev.txt` then `python -m pytest tests`
